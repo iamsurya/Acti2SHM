@@ -16,7 +16,7 @@ namespace Acti2SHM
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new Form1());
+            Application.Run(new Frm_MainForm());
         }
     }
 }
