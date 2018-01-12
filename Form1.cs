@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -12,15 +14,39 @@ namespace Acti2SHM
 {
     public partial class Frm_MainForm : Form
     {
+        double q0, q1, q2, q3;
+        double beta;
+        double sampleFreq;
+        UInt16 AXCOL, AYCOL, AZCOL, GXCOL, GYCOL, GZCOL, MXCOL, MYCOL, MZCOL; /* Column Numbers for the CSV */
+        int actigraphHeaderLines; /* Number of lines in the Actigraph Header to Ignore */
+        char separator;
+        String inputFileName;
+        String outputFileName;
+        int BytesPerLine;   /* Precomputed value of average bytes per line in Actigraph CSV. Used to estimate progress */
+        ManualResetEvent runThread = new ManualResetEvent(false);
+        Thread t;
+        bool EndThread;
+        BinaryWriter DataWriter;
+        StreamReader reader;
+        StreamWriter EventsWriter;
+        String ExtractDateString;
+        bool datefound = false;
+
+        enum Devices { Invensense, Actigraph, iPhone };
+        Devices CurrentDevice;
+
         public Frm_MainForm()
         {
             InitializeComponent();
-        }
 
-        double q0, q1, q2, q3;
-        double beta = 0.041;
-        double sampleFreq = 15.0f;
-        int TimeCOL, AXCOL, AYCOL, TempCOL, AZCOL, GXCOL, GYCOL, GZCOL, MXCOL, MYCOL, MZCOL; /* Column Numbers for the CSV */
+            /* Init values */
+            separator = ',';
+            AXCOL = 1; AYCOL = 2; AZCOL = 3; GXCOL = 5; GYCOL = 6; GZCOL = 7; MXCOL = 8; MYCOL = 9; MZCOL = 10;
+            sampleFreq = 15.0f;
+            beta = 0.041;
+            BytesPerLine = (int) ((long)1018925758 / (long)8200000);
+            actigraphHeaderLines = 11;
+        }
 
         /// <summary>
         /// Calculate Gravity (GravX, GravY, GravZ) from quaternions
@@ -166,9 +192,7 @@ namespace Acti2SHM
             q2 *= recipNorm;
             q3 *= recipNorm;
         }
-
-
-        
+  
         /// <summary>
         /// Using only 6 DOF to calculate quaternion (when Acceleromter normalization results in NaN).
         /// Uses globals: q0, q1, q2, q3
@@ -256,15 +280,15 @@ namespace Acti2SHM
         /// <param name="lx">Output lx</param>
         /// <param name="ly">Output lx</param>
         /// <param name="lz">Output lx</param>
-        private void CalculateLinear(String[] values, out double lx, out double ly, out double lz)
+        private void CalculateLinear(String[] values, out double lx, out double ly, out double lz, out double Gx, out double Gy, out double Gz)
         {
             lx = ly = lz = 0;
 
             double CalcGravX, CalcGravY, CalcGravZ;
             
-            double Gx = double.Parse(values[GXCOL]);
-            double Gy = double.Parse(values[GYCOL]);
-            double Gz = double.Parse(values[GZCOL]);
+            Gx = double.Parse(values[GXCOL]);
+            Gy = double.Parse(values[GYCOL]);
+            Gz = double.Parse(values[GZCOL]);
 
             double Ax = double.Parse(values[AXCOL]);
             double Ay = double.Parse(values[AYCOL]);
@@ -280,6 +304,49 @@ namespace Acti2SHM
             lx = Ax - (CalcGravX * 0.98);
             ly = Ay - (CalcGravY * 0.98);
             lz = Az - (CalcGravZ * 0.98);
+        }
+
+
+        /// <summary>
+        /// Has to correct for orientation in the order Phoneview expects it.
+        /// The order was set for MarkerParser as Ax, Ay, Az, Pitch*, Roll, Yaw*
+        /// so Ax, Ay, Az, Gx, Gy, Gz need to be adjusted to match it
+        /// </summary>
+        /// <param name="DeviceID"></param>
+        /// <param name="lx"></param>
+        /// <param name="ly"></param>
+        /// <param name="lz"></param>
+        /// <param name="gx"></param>
+        /// <param name="gy"></param>
+        /// <param name="gz"></param>
+        private void OrientAxes(Devices DeviceID, ref double lx, ref double ly, ref double lz, ref double gx, ref double gy, ref double gz)
+        {
+            double temp = 0.00;
+
+            switch (DeviceID)
+            {
+                case Devices.Invensense:
+                    /* Shimmer uses reversed directions for rotation and reverse direction for Z axis */
+                    // Rotate Accelerations
+                    lz = -lz;
+                    // Rotate Gyroscope
+                    gx = -gx;
+                    gy = -gy;
+                    break;
+                case Devices.Actigraph:
+                    // Rotate Acceleration
+                    lz = lz * -1;
+                    temp = -lx;
+                    lx = ly;
+                    ly = temp;
+                    // Rotate Angular Velocities
+                    gz = gz * -1;
+                    temp = -gx;
+                    gx = gy;
+                    gy = temp;
+                    break;
+                default: break;
+            }
         }
 
 
@@ -304,23 +371,213 @@ namespace Acti2SHM
             // Process input if the user clicked OK.
             if (userClickedOK == DialogResult.OK)
             {
-                TB_IP_file.Text = ofn.FileName;
-                String InputFile = TB_IP_file.Text;
-                String OPFile = InputFile.Substring(0, InputFile.Length - 4) + ".acti";
-                TB_outfile.Text = OPFile;
+                TB_infile.Text = ofn.FileName;
+                TB_outfile.Text = TB_infile.Text.Substring(0, TB_infile.Text.Length - 4) + ".act";
 
                 lb_Status.Text = @"Ready";
                 lb_Status.ForeColor = Color.Green;
                 lb_Status.Refresh();
             }
         }
+ 
+        /// <summary>
+        /// This thread parses data from the csv file and writes an SHM file with linear acceleration and gyroscope data.
+        /// The program hangs for a very long time if a thread is not used and confuses Windows (which asks if it should be terminated).
+        /// </summary>
+        private void WorkerThread()
+        {
+            q0 = 1;
+            q1 = q2 = q3 = 0;
+
+            long CurrentLine;
+
+            UInt16 Percentage = 0;
+            long TotalLines;
+            double lx, ly, lz, Gx, Gy, Gz;
+            String DateString;
+            String TimeString;
+
+            string line = "2018-01-03T09:24:00.0800000,-0.014648,-0.485840,0.915527,44.122773,-2.258301,14.099122,-77.392583,22.265624,-14.648437,-19.628905";
+            var values = line.Split(separator);
+
+            CurrentDevice = (Devices)System.Enum.Parse(typeof(Devices), "Actigraph");
+
+            while (!EndThread)
+            {
+                runThread.WaitOne(Timeout.Infinite);
+
+                while (!EndThread)
+                {
+                    try
+                    {   
+                        Percentage = 0;
+                       
+                        /* Modify the button so it can't be pressed again (avoids launching of multiple threads) */
+                        lb_Status.Parent.Invoke((MethodInvoker)delegate {
+                            lb_Status.Text = @"Working";
+                            lb_Status.ForeColor = Color.YellowGreen;
+                            lb_Status.Refresh();
+                            BTN_go.Enabled = false;
+                        });
+
+                        reader = new StreamReader(File.OpenRead(inputFileName));
+                        DataWriter = new BinaryWriter(File.OpenWrite(outputFileName));
+
+                        string eventsfilename = outputFileName.Substring(0, outputFileName.Length - 5) + "-events.txt";
+                        EventsWriter = new StreamWriter(File.OpenWrite(eventsfilename));
+
+                        /* Read filesize to estimate progress */
+                        FileInfo FI = new FileInfo(inputFileName);
+                        TotalLines = (long) ((UInt64)FI.Length / (UInt64) BytesPerLine);
+
+                        CurrentLine = 0;
+
+                        Percentage =(UInt16)  (CurrentLine * 100 / TotalLines);
+
+
+                        /* Read header lines with seperator information */
+                        for(int i = 0; i < actigraphHeaderLines; i++)
+                        {
+                            line = reader.ReadLine();
+                        }
+
+                        /* Check if CSV column order matches */
+                        if (line.CompareTo("Timestamp,Accelerometer X,Accelerometer Y,Accelerometer Z,Temperature,Gyroscope X,Gyroscope Y,Gyroscope Z,Magnetometer X,Magnetometer Y,Magnetometer Z") != 0)
+                        {
+                            lb_Status.Parent.Invoke((MethodInvoker)delegate
+                            {
+                                BTN_go.Enabled = true;
+                                lb_Status.Text = "Number of columns in the CSV file do not match.";
+                                lb_Status.ForeColor = Color.Red;
+                            });
+                            DataWriter.Close();
+                            EndThread = true;
+                            return;
+
+                        }
+
+                        /* Segment 1 */
+                        CurrentLine = 0;
+
+                        while (true)
+                        {
+                            line = reader.ReadLine();
+                            if (reader.EndOfStream) break;
+
+                            Percentage = (UInt16)(CurrentLine * 100 / TotalLines);
+
+                            PB_convert.Parent.Invoke((MethodInvoker)delegate
+                            {
+                                PB_convert.ForeColor = Color.YellowGreen;
+                                PB_convert.Value = ((UInt16)Percentage <= 100) ? (UInt16)Percentage : 100;
+                            });
+
+                            if (line.Substring(0, 10) != ExtractDateString)
+                                continue;
+
+                            /* Get Start Time from the text file */
+                            if (datefound == false)
+                            {
+                                datefound = true;
+                                values = line.Split(separator);
+                                DateString = values[0].Substring(0, 10);
+                                TimeString = values[0].Substring(11, 8);
+                                EventsWriter.WriteLine("START\t" + DateString + "\t" + TimeString);
+                            }
+
+                            if((CurrentLine % 7) == 0)
+                            {
+                                values = line.Split(separator);
+
+                                CalculateLinear(values, out lx, out ly, out lz, out Gx, out Gy, out Gz);
+                                //OrientAxes(CurrentDevice, ref lx, ref ly, ref lz, ref Gx, ref Gy, ref Gz);
+
+                                /* Shimmerview is expecting data in the following order: Ax, Ay, Az, Pitch*, Roll, Yaw* */
+                                /* Pitch and Yaw positions don't matter, but Roll is used for features */
+                                DataWriter.Write((float)lx);    /* Ax */
+                                DataWriter.Write((float)ly);    /* Ay */
+                                DataWriter.Write((float)lz);    /* Az */
+                                DataWriter.Write((float)Gx);    /* Pitch */
+                                DataWriter.Write((float)Gy);    /* Roll */
+                                DataWriter.Write((float)Gz);    /* Yaw */
+                            }
+
+                            CurrentLine++;
+                            if (CurrentLine == 100) CurrentLine = 0;
+                        }
+
+                        String Date = values[0].Substring(0, 10);
+                        String Time = values[0].Substring(11, 8);
+                        EventsWriter.WriteLine("END\t" + Date + "\t" + Time);
+
+                        DataWriter.Close();
+                        reader.Close();
+                        EventsWriter.Close();
+
+                        PB_convert.Parent.Invoke((MethodInvoker)delegate
+                       {
+                           PB_convert.ForeColor = Color.Green;
+                           PB_convert.Value = 100;
+                           lb_Status.Text = "Finished Reading File.";
+                           lb_Status.ForeColor = Color.Green;
+                           BTN_PickFile.Enabled = true;
+                           lb_Status.Refresh();
+                       });
+
+                        if(datefound == false)
+                        {
+                            lb_Status.Parent.Invoke((MethodInvoker)delegate
+                           {
+                               lb_Status.Text = "Could not find the date you asked for in the file";
+                               lb_Status.ForeColor = Color.Red;
+                           });
+                        }
+
+                        EndThread = true;
+                    }
+
+                    catch (Exception ex)
+                    {
+                        lb_Status.Parent.Invoke((MethodInvoker)delegate {
+                            BTN_go.Enabled = false;
+                            lb_Status.Text = "An error has occured. Close this program and try again." + ex.ToString();
+                            lb_Status.ForeColor = Color.Red;
+                        });
+                        DataWriter.Close();
+                        reader.Close();
+                        EventsWriter.Close();
+
+                        EndThread = true;
+                        return;
+                    }
+                }
+            }
+        }
 
         private void Btn_go_Click(object sender, EventArgs e)
         {
-            char SplitChar = ',';
-            TimeCOL = 1; AXCOL = 2; AYCOL = 3; AZCOL = 4; TempCOL = 5; GXCOL = 6; GYCOL = 7; GZCOL = 8; MXCOL = 9; MYCOL = 10; MZCOL = 11;
+            ExtractDateString = dtp_dateTimePicker.Value.ToString("u").Substring(0, 10);
+            inputFileName = TB_infile.Text;
+            outputFileName = TB_outfile.Text;
 
-
+            /* Check for errors in Filename */
+            if( (TB_infile.Text.Equals("", StringComparison.Ordinal)) || (TB_outfile.Text.Equals("", StringComparison.Ordinal)) )
+            {
+                lb_Status.Parent.Invoke((MethodInvoker)delegate
+                {
+                    BTN_go.Enabled = true;
+                    lb_Status.Text = "Please check input / output file paths";
+                    lb_Status.ForeColor = Color.Red;
+                });
+            }
+            else /* Run the thread to process data */
+            {
+                /* Create new thread and run */
+                t = new Thread(WorkerThread);
+                t.Start();
+                /* Reset the thread */
+                runThread.Set();
+            }
         }
     }
 }
